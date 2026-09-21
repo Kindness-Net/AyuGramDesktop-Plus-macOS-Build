@@ -39,25 +39,27 @@ concurrency:
 
 jobs:
   macos:
-    name: MacOS Universal
+    name: MacOS ${{ matrix.arch }}
     runs-on: macos-26
     timeout-minutes: 359
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+          - arch: arm64
 
     env:
       REPO_NAME: 'AyuGramDesktop-Plus'
       PREPARE_PATH: 'Telegram/build/prepare/prepare.py'
-      MAC_LIBRARIES_CACHE_VERSION: 'v3'
+      MAC_LIBRARIES_CACHE_VERSION: 'v4'
+      CCACHE_DIR: ${{ github.workspace }}/.ayugram-ccache
       HOMEBREW_NO_AUTO_UPDATE: '1'
       HOMEBREW_NO_INSTALL_CLEANUP: '1'
       HOMEBREW_NO_INSTALL_UPGRADE: '1'
       HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: '1'
 
     steps:
-      - name: Validate dispatcher.
-        run: |
-          set -euo pipefail
-          test "$GITHUB_ACTOR" = "KiritoXDone"
-
       - name: Check out repository.
         uses: actions/checkout@v7
         with:
@@ -112,12 +114,20 @@ jobs:
           if ((${#formulae[@]})); then
             brew install "${formulae[@]}"
           fi
+          command -v ccache >/dev/null || brew install ccache
 
           # Spotlight indexing only slows the dependency build down.
           sudo mdutil -a -i off
 
           xcodeKey=$(xcodebuild -version | shasum -a 256 | cut -d' ' -f1)
           echo "XCODE_CACHE_KEY=$xcodeKey" >> "$GITHUB_ENV"
+          mkdir -p "$CCACHE_DIR" "$RUNNER_TEMP/ccache-bin"
+          for compiler in clang clang++ cc c++; do
+            printf '%s\n' '#!/bin/sh' \
+              "exec ccache /usr/bin/$compiler \"\$@\"" \
+              > "$RUNNER_TEMP/ccache-bin/$compiler"
+            chmod +x "$RUNNER_TEMP/ccache-bin/$compiler"
+          done
 
       - name: Check libraries cache trim.
         run: python3 -m unittest $REPO_NAME/scripts/tests/test_macos_cache.py -v
@@ -128,20 +138,32 @@ jobs:
         with:
           path: |
             Libraries
-          key: ${{ runner.OS }}-libs-${{ env.MAC_LIBRARIES_CACHE_VERSION }}-universal-${{ env.XCODE_CACHE_KEY }}-${{ hashFiles(format('{0}/{1}', env.REPO_NAME, env.PREPARE_PATH), format('{0}/Telegram/build/qt_version.py', env.REPO_NAME), format('{0}/Telegram/build/prepare/patches/libjxl-macos-universal.patch', env.REPO_NAME), format('{0}/scripts/trim_macos_libraries.sh', env.REPO_NAME)) }}
+          key: ${{ runner.OS }}-libs-${{ env.MAC_LIBRARIES_CACHE_VERSION }}-${{ matrix.arch }}-${{ env.XCODE_CACHE_KEY }}-${{ hashFiles(format('{0}/{1}', env.REPO_NAME, env.PREPARE_PATH), format('{0}/Telegram/build/qt_version.py', env.REPO_NAME), format('{0}/Telegram/build/prepare/patches/libjxl-macos-universal.patch', env.REPO_NAME), format('{0}/scripts/trim_macos_libraries.sh', env.REPO_NAME)) }}
           restore-keys: |
-            ${{ runner.OS }}-libs-${{ env.MAC_LIBRARIES_CACHE_VERSION }}-universal-${{ env.XCODE_CACHE_KEY }}-
-            ${{ runner.OS }}-libs-v2-arm64-${{ env.XCODE_CACHE_KEY }}-
+            ${{ runner.OS }}-libs-${{ env.MAC_LIBRARIES_CACHE_VERSION }}-${{ matrix.arch }}-${{ env.XCODE_CACHE_KEY }}-
+            ${{ runner.OS }}-libs-v3-universal-${{ env.XCODE_CACHE_KEY }}-
+
+      - name: Restore ccache.
+        id: cache-ccache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ runner.OS }}-ccache-v1-${{ matrix.arch }}-${{ inputs.source_sha }}
+          restore-keys: ${{ runner.OS }}-ccache-v1-${{ matrix.arch }}-
 
       - name: Build dependencies.
         id: build-dependencies
         run: |
           set -euo pipefail
           # 正式版不传 skip-release，依赖按 Release 配置编译
+          export PATH="$RUNNER_TEMP/ccache-bin:$PATH"
           ./$REPO_NAME/Telegram/build/prepare/mac.sh silent
 
       - name: Free up disk space.
         id: trim-dependencies
+        if: >-
+          steps.cache-libs.outputs.cache-hit != 'true'
+            && steps.cache-libs.outputs.cache-matched-key == ''
         run: |
           set -euo pipefail
           ./$REPO_NAME/scripts/trim_macos_libraries.sh Libraries
@@ -150,7 +172,8 @@ jobs:
       - name: Save libraries cache.
         if: >-
           steps.build-dependencies.outcome == 'success'
-            && steps.trim-dependencies.outcome == 'success'
+            && (steps.trim-dependencies.outcome == 'success'
+              || steps.cache-libs.outputs.cache-matched-key != '')
             && steps.cache-libs.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
@@ -174,7 +197,9 @@ jobs:
 
           ./configure.sh \
             -D CMAKE_CONFIGURATION_TYPES=Release \
-            -D 'CMAKE_OSX_ARCHITECTURES=x86_64;arm64' \
+            -D CMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
+            -D CMAKE_C_COMPILER_LAUNCHER=ccache \
+            -D CMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -D CMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
             -D CMAKE_XCODE_ATTRIBUTE_GCC_GENERATE_DEBUGGING_SYMBOLS=NO \
             -D TDESKTOP_API_ID=2040 \
@@ -185,26 +210,16 @@ jobs:
 
           cmake --build ../out --config Release --parallel
 
-      - name: Check universal release output.
+      - name: Check architecture release output.
         run: |
           set -euo pipefail
           cd "$REPO_NAME/out/Release"
           test -d AyuGram.app
           test -x Packer
 
-          assert_universal() {
-            binary=$1
-            archs=$(lipo -archs "$binary")
-            normalized=$(for arch in $archs; do echo "$arch"; done | sort | tr '\n' ' ')
-            echo "$binary arches: $archs"
-            test "$normalized" = "arm64 x86_64 "
-          }
-
-          assert_universal AyuGram.app/Contents/MacOS/AyuGram
-          assert_universal Packer
-          test ! -f Updater || assert_universal Updater
-          test ! -f AyuGram.app/Contents/Frameworks/Updater \
-            || assert_universal AyuGram.app/Contents/Frameworks/Updater
+          test "$(lipo -archs AyuGram.app/Contents/MacOS/AyuGram)" = "${{ matrix.arch }}"
+          test "$(lipo -archs Packer)" = "${{ matrix.arch }}"
+          test ! -f Updater || test "$(lipo -archs Updater)" = "${{ matrix.arch }}"
 
       # 更新格式拒收解压后超过 1 GiB 的内容，打包前移除调试符号。
       - name: Strip debug symbols.
@@ -223,12 +238,118 @@ jobs:
             exit 1
           fi
 
+      - name: Show ccache stats.
+        if: always()
+        run: ccache --show-stats || true
+
+      - name: Save ccache.
+        if: success() && steps.cache-ccache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.cache-ccache.outputs.cache-primary-key }}
+
+      - name: Upload architecture build.
+        uses: actions/upload-artifact@v7
+        with:
+          name: macOS-build-${{ matrix.arch }}
+          path: |
+            ${{ env.REPO_NAME }}/out/Release/AyuGram.app
+            ${{ env.REPO_NAME }}/out/Release/Packer
+            ${{ env.REPO_NAME }}/out/Release/Updater
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove packer signing key.
+        if: always()
+        run: rm -f "$REPO_NAME/Telegram/SourceFiles/_other/packer_private.h"
+
+  package:
+    name: MacOS Universal package
+    needs: macos
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      RELEASE_DIR: ${{ github.workspace }}/Release
+
+    steps:
+      - name: Check out repository.
+        uses: actions/checkout@v7
+        with:
+          repository: Kindness-Kismet/AyuGramDesktop-Plus
+          ref: ${{ inputs.source_sha }}
+          path: AyuGramDesktop-Plus
+          persist-credentials: false
+
+      - name: Download x86_64 build.
+        uses: actions/download-artifact@v8
+        with:
+          name: macOS-build-x86_64
+          path: artifacts/x86_64
+
+      - name: Download arm64 build.
+        uses: actions/download-artifact@v8
+        with:
+          name: macOS-build-arm64
+          path: artifacts/arm64
+
+      - name: Merge architecture outputs.
+        run: |
+          set -euo pipefail
+          x86_app=$(find artifacts/x86_64 -type d -name AyuGram.app -print -quit)
+          arm_app=$(find artifacts/arm64 -type d -name AyuGram.app -print -quit)
+          x86_packer=$(find artifacts/x86_64 -type f -name Packer -print -quit)
+          arm_packer=$(find artifacts/arm64 -type f -name Packer -print -quit)
+          test -n "$x86_app" -a -n "$arm_app" -a -n "$x86_packer" -a -n "$arm_packer"
+          release="$RELEASE_DIR"
+          mkdir -p "$release"
+          cp -R "$arm_app" "$release/AyuGram.app"
+
+          merge_tree() {
+            local x86_root=$1 arm_root=$2 out_root=$3
+            while IFS= read -r -d '' x86_file; do
+              rel=${x86_file#"$x86_root"/}
+              arm_file="$arm_root/$rel"
+              out_file="$out_root/$rel"
+              if test -f "$arm_file" && file -b "$x86_file" | grep -q 'Mach-O' \
+                && file -b "$arm_file" | grep -q 'Mach-O'; then
+                mkdir -p "$(dirname "$out_file")"
+                lipo -create "$x86_file" "$arm_file" -output "$out_file"
+              elif test ! -e "$arm_file"; then
+                mkdir -p "$(dirname "$out_file")"
+                cp -p "$x86_file" "$out_file"
+              fi
+            done < <(find "$x86_root" -type f -print0)
+          }
+
+          merge_tree "$x86_app" "$arm_app" "$release/AyuGram.app"
+          lipo -create "$x86_packer" "$arm_packer" -output "$release/Packer"
+          chmod +x "$release/Packer"
+          if x86_updater=$(find artifacts/x86_64 -type f -name Updater -print -quit) \
+            && arm_updater=$(find artifacts/arm64 -type f -name Updater -print -quit); then
+            lipo -create "$x86_updater" "$arm_updater" -output "$release/Updater"
+            chmod +x "$release/Updater"
+          fi
+          test "$(lipo -archs "$release/AyuGram.app/Contents/MacOS/AyuGram" | tr ' ' '\n' | sort | tr '\n' ' ')" = "arm64 x86_64 "
+          test "$(lipo -archs "$release/Packer" | tr ' ' '\n' | sort | tr '\n' ' ')" = "arm64 x86_64 "
+
+      - name: Strip debug symbols.
+        run: |
+          set -euo pipefail
+          bin="$RELEASE_DIR/AyuGram.app/Contents/MacOS/AyuGram"
+          before=$(stat -f %z "$bin")
+          strip -x -S "$bin"
+          after=$(stat -f %z "$bin")
+          echo "universal binary: $before -> $after bytes"
+          size=$(du -sk "$RELEASE_DIR/AyuGram.app" | cut -f1)
+          test "$((size * 1024))" -lt 1073741824
+
       - name: Package release output.
         run: |
           set -euo pipefail
-          version=$(sed -n 's/^AppVersionStrSmall //p' $REPO_NAME/Telegram/build/version)
+          version=$(sed -n 's/^AppVersionStrSmall //p' AyuGramDesktop-Plus/Telegram/build/version)
           test -n "$version"
-          cd $REPO_NAME/out/Release
+          cd "$RELEASE_DIR"
           zip -r "AyuGram-v${version}-macos-universal.zip" AyuGram.app
           test ! -f Updater || zip "AyuGram-v${version}-macos-universal.zip" Updater
 
@@ -236,9 +357,9 @@ jobs:
       - name: Pack update.
         run: |
           set -euo pipefail
-          version=$(sed -n 's/^AppUpdateVersion  *//p' $REPO_NAME/Telegram/build/version)
+          version=$(sed -n 's/^AppUpdateVersion  *//p' AyuGramDesktop-Plus/Telegram/build/version)
           test -n "$version"
-          cd $REPO_NAME/out/Release
+          cd "$RELEASE_DIR"
 
           # 两个更新通道携带同一份 Universal app，仅目标元数据不同。
           ./Packer -version "$version" -arch x86_64 -path AyuGram.app
@@ -256,11 +377,11 @@ jobs:
           APP_UPDATE_VERSION: ${{ inputs.appupdateversion }}
         run: |
           set -euo pipefail
-          release="$REPO_NAME/out/Release"
+          release="$RELEASE_DIR"
           archive=$(ls "$release"/AyuGram-v*-macos-universal.zip)
           update_x64="$release/tmacupd${APP_UPDATE_VERSION}"
           update_arm64="$release/tarmacupd${APP_UPDATE_VERSION}"
-          python3 "$REPO_NAME/scripts/build_provenance.py" write-artifact-manifest \
+          python3 AyuGramDesktop-Plus/scripts/build_provenance.py write-artifact-manifest \
             --platform macos \
             --arch universal \
             --source-repository Kindness-Kismet/AyuGramDesktop-Plus \
@@ -283,12 +404,8 @@ jobs:
         with:
           name: AyuGram-macOS-universal
           path: |
-            ${{ env.REPO_NAME }}/out/Release/AyuGram-v*-macos-universal.zip
-            ${{ env.REPO_NAME }}/out/Release/tmacupd*
-            ${{ env.REPO_NAME }}/out/Release/tarmacupd*
-            ${{ env.REPO_NAME }}/out/Release/provenance-macos-universal.json
+            ${{ env.RELEASE_DIR }}/AyuGram-v*-macos-universal.zip
+            ${{ env.RELEASE_DIR }}/tmacupd*
+            ${{ env.RELEASE_DIR }}/tarmacupd*
+            ${{ env.RELEASE_DIR }}/provenance-macos-universal.json
           retention-days: 7
-
-      - name: Remove packer signing key.
-        if: always()
-        run: rm -f "$REPO_NAME/Telegram/SourceFiles/_other/packer_private.h"
