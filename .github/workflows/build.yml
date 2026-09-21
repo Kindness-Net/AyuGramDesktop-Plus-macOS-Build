@@ -205,10 +205,14 @@ jobs:
           cd $REPO_NAME/Telegram
 
           # Xcode generator 会忽略 CMAKE_*_COMPILER_LAUNCHER，必须经 Xcode attribute 注入 wrapper。
+          # 多架构时 AUTOMOC 跳过 moc_predefs；单架构会生成，其 -dM -E 命令不含平台标志，
+          # clang 回退读取 xcodebuild 脚本阶段导出的多个 *_DEPLOYMENT_TARGET 环境变量并报冲突。
+          # 该命令是 CMake 生成物无法注入标志，直接关闭 predefs 生成。
           export CCACHE_SLOPPINESS=pch_defines,time_macros
           ./configure.sh \
             -D CMAKE_CONFIGURATION_TYPES=Release \
             -D CMAKE_OSX_ARCHITECTURES=${{ matrix.cmake_arch }} \
+            -D CMAKE_AUTOMOC_COMPILER_PREDEFINES=OFF \
             -D "CMAKE_XCODE_ATTRIBUTE_CC=$RUNNER_TEMP/ccache-bin/clang" \
             -D "CMAKE_XCODE_ATTRIBUTE_CXX=$RUNNER_TEMP/ccache-bin/clang++" \
             -D CMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
