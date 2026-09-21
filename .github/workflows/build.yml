@@ -46,8 +46,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - arch: x86_64
+          - arch: x64
+            cmake_arch: x86_64
+            updater: tmacupd
           - arch: arm64
+            cmake_arch: arm64
+            updater: tarmacupd
 
     env:
       REPO_NAME: 'AyuGramDesktop-Plus'
@@ -197,7 +201,7 @@ jobs:
 
           ./configure.sh \
             -D CMAKE_CONFIGURATION_TYPES=Release \
-            -D CMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
+            -D CMAKE_OSX_ARCHITECTURES=${{ matrix.cmake_arch }} \
             -D CMAKE_C_COMPILER_LAUNCHER=ccache \
             -D CMAKE_CXX_COMPILER_LAUNCHER=ccache \
             -D CMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
@@ -217,9 +221,9 @@ jobs:
           test -d AyuGram.app
           test -x Packer
 
-          test "$(lipo -archs AyuGram.app/Contents/MacOS/AyuGram)" = "${{ matrix.arch }}"
-          test "$(lipo -archs Packer)" = "${{ matrix.arch }}"
-          test ! -f Updater || test "$(lipo -archs Updater)" = "${{ matrix.arch }}"
+          test "$(lipo -archs AyuGram.app/Contents/MacOS/AyuGram)" = "${{ matrix.cmake_arch }}"
+          test "$(lipo -archs Packer)" = "${{ matrix.cmake_arch }}"
+          test ! -f Updater || test "$(lipo -archs Updater)" = "${{ matrix.cmake_arch }}"
 
       # 更新格式拒收解压后超过 1 GiB 的内容，打包前移除调试符号。
       - name: Strip debug symbols.
@@ -249,123 +253,24 @@ jobs:
           path: ${{ env.CCACHE_DIR }}
           key: ${{ steps.cache-ccache.outputs.cache-primary-key }}
 
-      - name: Upload architecture build.
-        uses: actions/upload-artifact@v7
-        with:
-          name: macOS-build-${{ matrix.arch }}
-          path: |
-            ${{ env.REPO_NAME }}/out/Release/AyuGram.app
-            ${{ env.REPO_NAME }}/out/Release/Packer
-            ${{ env.REPO_NAME }}/out/Release/Updater
-          if-no-files-found: error
-          retention-days: 7
-
-      - name: Remove packer signing key.
-        if: always()
-        run: rm -f "$REPO_NAME/Telegram/SourceFiles/_other/packer_private.h"
-
-  package:
-    name: MacOS Universal package
-    needs: macos
-    runs-on: macos-26
-    timeout-minutes: 60
-    env:
-      RELEASE_DIR: ${{ github.workspace }}/Release
-
-    steps:
-      - name: Check out repository.
-        uses: actions/checkout@v7
-        with:
-          repository: Kindness-Kismet/AyuGramDesktop-Plus
-          ref: ${{ inputs.source_sha }}
-          path: AyuGramDesktop-Plus
-          persist-credentials: false
-
-      - name: Download x86_64 build.
-        uses: actions/download-artifact@v8
-        with:
-          name: macOS-build-x86_64
-          path: artifacts/x86_64
-
-      - name: Download arm64 build.
-        uses: actions/download-artifact@v8
-        with:
-          name: macOS-build-arm64
-          path: artifacts/arm64
-
-      - name: Merge architecture outputs.
-        run: |
-          set -euo pipefail
-          x86_app=$(find artifacts/x86_64 -type d -name AyuGram.app -print -quit)
-          arm_app=$(find artifacts/arm64 -type d -name AyuGram.app -print -quit)
-          x86_packer=$(find artifacts/x86_64 -type f -name Packer -print -quit)
-          arm_packer=$(find artifacts/arm64 -type f -name Packer -print -quit)
-          test -n "$x86_app" -a -n "$arm_app" -a -n "$x86_packer" -a -n "$arm_packer"
-          release="$RELEASE_DIR"
-          mkdir -p "$release"
-          cp -R "$arm_app" "$release/AyuGram.app"
-
-          merge_tree() {
-            local x86_root=$1 arm_root=$2 out_root=$3
-            while IFS= read -r -d '' x86_file; do
-              rel=${x86_file#"$x86_root"/}
-              arm_file="$arm_root/$rel"
-              out_file="$out_root/$rel"
-              if test -f "$arm_file" && file -b "$x86_file" | grep -q 'Mach-O' \
-                && file -b "$arm_file" | grep -q 'Mach-O'; then
-                mkdir -p "$(dirname "$out_file")"
-                lipo -create "$x86_file" "$arm_file" -output "$out_file"
-              elif test ! -e "$arm_file"; then
-                mkdir -p "$(dirname "$out_file")"
-                cp -p "$x86_file" "$out_file"
-              fi
-            done < <(find "$x86_root" -type f -print0)
-          }
-
-          merge_tree "$x86_app" "$arm_app" "$release/AyuGram.app"
-          lipo -create "$x86_packer" "$arm_packer" -output "$release/Packer"
-          chmod +x "$release/Packer"
-          if x86_updater=$(find artifacts/x86_64 -type f -name Updater -print -quit) \
-            && arm_updater=$(find artifacts/arm64 -type f -name Updater -print -quit); then
-            lipo -create "$x86_updater" "$arm_updater" -output "$release/Updater"
-            chmod +x "$release/Updater"
-          fi
-          test "$(lipo -archs "$release/AyuGram.app/Contents/MacOS/AyuGram" | tr ' ' '\n' | sort | tr '\n' ' ')" = "arm64 x86_64 "
-          test "$(lipo -archs "$release/Packer" | tr ' ' '\n' | sort | tr '\n' ' ')" = "arm64 x86_64 "
-
-      - name: Strip debug symbols.
-        run: |
-          set -euo pipefail
-          bin="$RELEASE_DIR/AyuGram.app/Contents/MacOS/AyuGram"
-          before=$(stat -f %z "$bin")
-          strip -x -S "$bin"
-          after=$(stat -f %z "$bin")
-          echo "universal binary: $before -> $after bytes"
-          size=$(du -sk "$RELEASE_DIR/AyuGram.app" | cut -f1)
-          test "$((size * 1024))" -lt 1073741824
-
       - name: Package release output.
         run: |
           set -euo pipefail
-          version=$(sed -n 's/^AppVersionStrSmall //p' AyuGramDesktop-Plus/Telegram/build/version)
+          version=$(sed -n 's/^AppVersionStrSmall //p' $REPO_NAME/Telegram/build/version)
           test -n "$version"
-          cd "$RELEASE_DIR"
-          zip -r "AyuGram-v${version}-macos-universal.zip" AyuGram.app
-          test ! -f Updater || zip "AyuGram-v${version}-macos-universal.zip" Updater
+          cd $REPO_NAME/out/Release
+          zip -r "AyuGram-v${version}-macos-${{ matrix.arch }}.zip" AyuGram.app
+          test ! -f Updater || zip "AyuGram-v${version}-macos-${{ matrix.arch }}.zip" Updater
 
-      # 包内固定放 AyuGram.app，客户端也按这个名字找，用户重命名 bundle 仍可更新
+      # 每个架构只生成自己的更新包，避免把两个架构塞进同一份 Universal 包。
       - name: Pack update.
         run: |
           set -euo pipefail
-          version=$(sed -n 's/^AppUpdateVersion  *//p' AyuGramDesktop-Plus/Telegram/build/version)
+          version=$(sed -n 's/^AppUpdateVersion  *//p' $REPO_NAME/Telegram/build/version)
           test -n "$version"
-          cd "$RELEASE_DIR"
-
-          # 两个更新通道携带同一份 Universal app，仅目标元数据不同。
-          ./Packer -version "$version" -arch x86_64 -path AyuGram.app
-          ./Packer -version "$version" -arch arm64 -path AyuGram.app
-          test -s "tmacupd${version}"
-          test -s "tarmacupd${version}"
+          cd $REPO_NAME/out/Release
+          ./Packer -version "$version" -arch ${{ matrix.cmake_arch }} -path AyuGram.app
+          test -s "${{ matrix.updater }}${version}"
 
       - name: Write artifact provenance.
         env:
@@ -377,13 +282,12 @@ jobs:
           APP_UPDATE_VERSION: ${{ inputs.appupdateversion }}
         run: |
           set -euo pipefail
-          release="$RELEASE_DIR"
-          archive=$(ls "$release"/AyuGram-v*-macos-universal.zip)
-          update_x64="$release/tmacupd${APP_UPDATE_VERSION}"
-          update_arm64="$release/tarmacupd${APP_UPDATE_VERSION}"
-          python3 AyuGramDesktop-Plus/scripts/build_provenance.py write-artifact-manifest \
+          release="$REPO_NAME/out/Release"
+          archive="$release/AyuGram-v${VERSION}-macos-${{ matrix.arch }}.zip"
+          update="$release/${{ matrix.updater }}${APP_UPDATE_VERSION}"
+          python3 "$REPO_NAME/scripts/build_provenance.py" write-artifact-manifest \
             --platform macos \
-            --arch universal \
+            --arch "${{ matrix.arch }}" \
             --source-repository Kindness-Kismet/AyuGramDesktop-Plus \
             --source-ref "$SOURCE_REF" \
             --source-sha "$SOURCE_SHA" \
@@ -394,18 +298,21 @@ jobs:
             --builder-run-attempt "$GITHUB_RUN_ATTEMPT" \
             --version "$VERSION" \
             --appupdateversion "$APP_UPDATE_VERSION" \
-            --output "$release/provenance-macos-universal.json" \
+            --output "$release/provenance-macos-${{ matrix.arch }}.json" \
             --file "$archive" \
-            --file "$update_x64" \
-            --file "$update_arm64"
+            --file "$update"
 
-      - name: Upload artifact.
+      - name: Upload architecture artifact.
         uses: actions/upload-artifact@v7
         with:
-          name: AyuGram-macOS-universal
+          name: AyuGram-macOS-${{ matrix.arch }}
           path: |
-            ${{ env.RELEASE_DIR }}/AyuGram-v*-macos-universal.zip
-            ${{ env.RELEASE_DIR }}/tmacupd*
-            ${{ env.RELEASE_DIR }}/tarmacupd*
-            ${{ env.RELEASE_DIR }}/provenance-macos-universal.json
+            ${{ env.REPO_NAME }}/out/Release/AyuGram-v*-macos-${{ matrix.arch }}.zip
+            ${{ env.REPO_NAME }}/out/Release/${{ matrix.updater }}*
+            ${{ env.REPO_NAME }}/out/Release/provenance-macos-${{ matrix.arch }}.json
+          if-no-files-found: error
           retention-days: 7
+
+      - name: Remove packer signing key.
+        if: always()
+        run: rm -f "$REPO_NAME/Telegram/SourceFiles/_other/packer_private.h"
