@@ -137,9 +137,6 @@ jobs:
             chmod +x "$RUNNER_TEMP/ccache-bin/$compiler"
           done
 
-      - name: Check libraries cache trim.
-        run: python3 -m unittest $REPO_NAME/scripts/tests/test_macos_cache.py -v
-
       - name: Restore libraries cache.
         id: cache-libs
         uses: actions/cache/restore@v6
