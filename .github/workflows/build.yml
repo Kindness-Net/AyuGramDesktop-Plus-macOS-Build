@@ -70,6 +70,7 @@ jobs:
           repository: Kindness-Kismet/AyuGramDesktop-Plus
           ref: ${{ inputs.source_sha }}
           submodules: recursive
+          fetch-depth: 1
           path: ${{ env.REPO_NAME }}
           persist-credentials: false
 
@@ -119,6 +120,7 @@ jobs:
             brew install "${formulae[@]}"
           fi
           command -v ccache >/dev/null || brew install ccache
+          ccache --max-size=4G
 
           # Spotlight indexing only slows the dependency build down.
           sudo mdutil -a -i off
@@ -126,9 +128,11 @@ jobs:
           xcodeKey=$(xcodebuild -version | shasum -a 256 | cut -d' ' -f1)
           echo "XCODE_CACHE_KEY=$xcodeKey" >> "$GITHUB_ENV"
           mkdir -p "$CCACHE_DIR" "$RUNNER_TEMP/ccache-bin"
-          for compiler in clang clang++ cc c++; do
+          # Xcode 构建环境的 PATH 不含 Homebrew 前缀，wrapper 必须用绝对路径。
+          ccache_bin=$(command -v ccache)
+          for compiler in clang clang++ cc c++ gcc g++; do
             printf '%s\n' '#!/bin/sh' \
-              "exec ccache /usr/bin/$compiler \"\$@\"" \
+              "exec $ccache_bin /usr/bin/$compiler \"\$@\"" \
               > "$RUNNER_TEMP/ccache-bin/$compiler"
             chmod +x "$RUNNER_TEMP/ccache-bin/$compiler"
           done
@@ -161,6 +165,7 @@ jobs:
           set -euo pipefail
           # 正式版不传 skip-release，依赖按 Release 配置编译
           export PATH="$RUNNER_TEMP/ccache-bin:$PATH"
+          export CCACHE_SLOPPINESS=pch_defines,time_macros
           ./$REPO_NAME/Telegram/build/prepare/mac.sh silent
 
       - name: Free up disk space.
@@ -199,11 +204,13 @@ jobs:
           set -euo pipefail
           cd $REPO_NAME/Telegram
 
+          # Xcode generator 会忽略 CMAKE_*_COMPILER_LAUNCHER，必须经 Xcode attribute 注入 wrapper。
+          export CCACHE_SLOPPINESS=pch_defines,time_macros
           ./configure.sh \
             -D CMAKE_CONFIGURATION_TYPES=Release \
             -D CMAKE_OSX_ARCHITECTURES=${{ matrix.cmake_arch }} \
-            -D CMAKE_C_COMPILER_LAUNCHER=ccache \
-            -D CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -D "CMAKE_XCODE_ATTRIBUTE_CC=$RUNNER_TEMP/ccache-bin/clang" \
+            -D "CMAKE_XCODE_ATTRIBUTE_CXX=$RUNNER_TEMP/ccache-bin/clang++" \
             -D CMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
             -D CMAKE_XCODE_ATTRIBUTE_GCC_GENERATE_DEBUGGING_SYMBOLS=NO \
             -D TDESKTOP_API_ID=2040 \
