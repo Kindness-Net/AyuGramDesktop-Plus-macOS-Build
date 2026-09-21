@@ -39,27 +39,14 @@ concurrency:
 
 jobs:
   macos:
-    name: MacOS ${{ matrix.arch }}
-    runs-on: ${{ matrix.runner }}
+    name: MacOS Universal
+    runs-on: macos-26
     timeout-minutes: 359
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x64
-            runner: macos-26-intel
-            cmake_arch: x86_64
-            updater: tmacupd
-          - arch: arm64
-            runner: macos-26
-            cmake_arch: arm64
-            updater: tarmacupd
 
     env:
       REPO_NAME: 'AyuGramDesktop-Plus'
       PREPARE_PATH: 'Telegram/build/prepare/prepare.py'
-      MAC_LIBRARIES_CACHE_VERSION: 'v2'
+      MAC_LIBRARIES_CACHE_VERSION: 'v3'
       HOMEBREW_NO_AUTO_UPDATE: '1'
       HOMEBREW_NO_INSTALL_CLEANUP: '1'
       HOMEBREW_NO_INSTALL_UPGRADE: '1'
@@ -141,24 +128,30 @@ jobs:
         with:
           path: |
             Libraries
-          key: ${{ runner.OS }}-libs-${{ env.MAC_LIBRARIES_CACHE_VERSION }}-${{ matrix.arch }}-${{ env.XCODE_CACHE_KEY }}-${{ hashFiles(format('{0}/{1}', env.REPO_NAME, env.PREPARE_PATH), format('{0}/Telegram/build/qt_version.py', env.REPO_NAME), format('{0}/Telegram/build/prepare/patches/libjxl-macos-universal.patch', env.REPO_NAME), format('{0}/scripts/trim_macos_libraries.sh', env.REPO_NAME)) }}
+          key: ${{ runner.OS }}-libs-${{ env.MAC_LIBRARIES_CACHE_VERSION }}-universal-${{ env.XCODE_CACHE_KEY }}-${{ hashFiles(format('{0}/{1}', env.REPO_NAME, env.PREPARE_PATH), format('{0}/Telegram/build/qt_version.py', env.REPO_NAME), format('{0}/Telegram/build/prepare/patches/libjxl-macos-universal.patch', env.REPO_NAME), format('{0}/scripts/trim_macos_libraries.sh', env.REPO_NAME)) }}
           restore-keys: |
-            ${{ runner.OS }}-libs-${{ env.MAC_LIBRARIES_CACHE_VERSION }}-${{ matrix.arch }}-${{ env.XCODE_CACHE_KEY }}-
+            ${{ runner.OS }}-libs-${{ env.MAC_LIBRARIES_CACHE_VERSION }}-universal-${{ env.XCODE_CACHE_KEY }}-
+            ${{ runner.OS }}-libs-v2-arm64-${{ env.XCODE_CACHE_KEY }}-
 
       - name: Build dependencies.
+        id: build-dependencies
         run: |
           set -euo pipefail
           # 正式版不传 skip-release，依赖按 Release 配置编译
           ./$REPO_NAME/Telegram/build/prepare/mac.sh silent
 
       - name: Free up disk space.
+        id: trim-dependencies
         run: |
           set -euo pipefail
           ./$REPO_NAME/scripts/trim_macos_libraries.sh Libraries
 
       # 瘦身后立即入库，后续构建失败不再连带丢失依赖缓存
       - name: Save libraries cache.
-        if: steps.cache-libs.outputs.cache-hit != 'true'
+        if: >-
+          steps.build-dependencies.outcome == 'success'
+            && steps.trim-dependencies.outcome == 'success'
+            && steps.cache-libs.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: |
@@ -181,7 +174,7 @@ jobs:
 
           ./configure.sh \
             -D CMAKE_CONFIGURATION_TYPES=Release \
-            -D CMAKE_OSX_ARCHITECTURES=${{ matrix.cmake_arch }} \
+            -D 'CMAKE_OSX_ARCHITECTURES=x86_64;arm64' \
             -D CMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
             -D CMAKE_XCODE_ATTRIBUTE_GCC_GENERATE_DEBUGGING_SYMBOLS=NO \
             -D TDESKTOP_API_ID=2040 \
@@ -192,16 +185,26 @@ jobs:
 
           cmake --build ../out --config Release --parallel
 
-      - name: Check release output.
+      - name: Check universal release output.
         run: |
           set -euo pipefail
-          appPath="$REPO_NAME/out/Release/AyuGram.app"
-          if test -d "$appPath"; then
-            echo "Build successfully done! :)"
-          else
-            echo "Build error, output bundle does not exist."
-            exit 1
-          fi
+          cd "$REPO_NAME/out/Release"
+          test -d AyuGram.app
+          test -x Packer
+
+          assert_universal() {
+            binary=$1
+            archs=$(lipo -archs "$binary")
+            normalized=$(for arch in $archs; do echo "$arch"; done | sort | tr '\n' ' ')
+            echo "$binary arches: $archs"
+            test "$normalized" = "arm64 x86_64 "
+          }
+
+          assert_universal AyuGram.app/Contents/MacOS/AyuGram
+          assert_universal Packer
+          test ! -f Updater || assert_universal Updater
+          test ! -f AyuGram.app/Contents/Frameworks/Updater \
+            || assert_universal AyuGram.app/Contents/Frameworks/Updater
 
       # 更新格式拒收解压后超过 1 GiB 的内容，打包前移除调试符号。
       - name: Strip debug symbols.
@@ -226,8 +229,8 @@ jobs:
           version=$(sed -n 's/^AppVersionStrSmall //p' $REPO_NAME/Telegram/build/version)
           test -n "$version"
           cd $REPO_NAME/out/Release
-          zip -r "AyuGram-v${version}-macos-${{ matrix.arch }}.zip" AyuGram.app
-          test ! -f Updater || zip "AyuGram-v${version}-macos-${{ matrix.arch }}.zip" Updater
+          zip -r "AyuGram-v${version}-macos-universal.zip" AyuGram.app
+          test ! -f Updater || zip "AyuGram-v${version}-macos-universal.zip" Updater
 
       # 包内固定放 AyuGram.app，客户端也按这个名字找，用户重命名 bundle 仍可更新
       - name: Pack update.
@@ -237,12 +240,11 @@ jobs:
           test -n "$version"
           cd $REPO_NAME/out/Release
 
-          # 安装包和更新包必须与当前矩阵的目标架构一致。
-          archs=$(lipo -archs AyuGram.app/Contents/MacOS/AyuGram)
-          echo "bundle arches: $archs"
-          test "$archs" = "${{ matrix.cmake_arch }}"
-          ./Packer -version "$version" -arch ${{ matrix.cmake_arch }} -path AyuGram.app
-          test -s "${{ matrix.updater }}${version}"
+          # 两个更新通道携带同一份 Universal app，仅目标元数据不同。
+          ./Packer -version "$version" -arch x86_64 -path AyuGram.app
+          ./Packer -version "$version" -arch arm64 -path AyuGram.app
+          test -s "tmacupd${version}"
+          test -s "tarmacupd${version}"
 
       - name: Write artifact provenance.
         env:
@@ -255,11 +257,12 @@ jobs:
         run: |
           set -euo pipefail
           release="$REPO_NAME/out/Release"
-          archive=$(ls "$release"/AyuGram-v*-macos-${{ matrix.arch }}.zip)
-          update="$release/${{ matrix.updater }}${APP_UPDATE_VERSION}"
+          archive=$(ls "$release"/AyuGram-v*-macos-universal.zip)
+          update_x64="$release/tmacupd${APP_UPDATE_VERSION}"
+          update_arm64="$release/tarmacupd${APP_UPDATE_VERSION}"
           python3 "$REPO_NAME/scripts/build_provenance.py" write-artifact-manifest \
             --platform macos \
-            --arch "${{ matrix.arch }}" \
+            --arch universal \
             --source-repository Kindness-Kismet/AyuGramDesktop-Plus \
             --source-ref "$SOURCE_REF" \
             --source-sha "$SOURCE_SHA" \
@@ -270,18 +273,20 @@ jobs:
             --builder-run-attempt "$GITHUB_RUN_ATTEMPT" \
             --version "$VERSION" \
             --appupdateversion "$APP_UPDATE_VERSION" \
-            --output "$release/provenance-macos-${{ matrix.arch }}.json" \
+            --output "$release/provenance-macos-universal.json" \
             --file "$archive" \
-            --file "$update"
+            --file "$update_x64" \
+            --file "$update_arm64"
 
       - name: Upload artifact.
         uses: actions/upload-artifact@v7
         with:
-          name: AyuGram-macOS-${{ matrix.arch }}
+          name: AyuGram-macOS-universal
           path: |
-            ${{ env.REPO_NAME }}/out/Release/AyuGram-v*-macos-${{ matrix.arch }}.zip
-            ${{ env.REPO_NAME }}/out/Release/${{ matrix.updater }}*
-            ${{ env.REPO_NAME }}/out/Release/provenance-macos-${{ matrix.arch }}.json
+            ${{ env.REPO_NAME }}/out/Release/AyuGram-v*-macos-universal.zip
+            ${{ env.REPO_NAME }}/out/Release/tmacupd*
+            ${{ env.REPO_NAME }}/out/Release/tarmacupd*
+            ${{ env.REPO_NAME }}/out/Release/provenance-macos-universal.json
           retention-days: 7
 
       - name: Remove packer signing key.
